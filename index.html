@@ -463,11 +463,25 @@ async function playList(ids,start=0,label='',forceShuffle){
   else{queue=[...ids];qi=start}
   await load(true);
 }
-/* Le son est chargé en mémoire (et pas lu directement depuis la base) :
-   sur iPhone, un fichier lu depuis IndexedDB peut devenir illisible quand
-   l'appli passe en arrière-plan, ce qui cassait pause/lecture/avance rapide
-   depuis l'écran verrouillé. */
-const mem=new Map();let wantPlay=false,lastTime=0,fails=0;
+/* ---- Moteur de lecture, pensé pour l'écran verrouillé de l'iPhone ----
+   1. Le son est gardé en mémoire : un fichier lu depuis la base peut devenir
+      illisible quand l'appli passe en arrière-plan.
+   2. Pause « silencieuse » : sur iPhone, une vraie pause en arrière-plan fait
+      perdre la sortie son (bug connu d'iOS avec les applis web). Pendant une
+      pause, on joue donc un blanc sonore en boucle à la place du titre, et on
+      remet le titre à la même seconde quand tu appuies sur play. Après
+      5 minutes de pause, on fait une vraie pause pour économiser la batterie.
+   3. Le titre est joué en boucle et on détecte le retour au début pour passer
+      au suivant : quand un titre se termine « normalement », iOS ferme la
+      sortie son et le titre suivant ne peut plus démarrer écran verrouillé. */
+const IOS=/iP(hone|ad|od)/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+const mem=new Map();
+let wantPlay=false,lastTime=0,fails=0,trackURL=null,trackDur=0,holding=false,holdAt=0,holdTimer=0,prevT=0,manualSeek=0,lastSwap=0;
+const SILENCE=(()=>{const sr=8000,n=sr*2,b=new ArrayBuffer(44+n*2),v=new DataView(b),w=(o,t)=>{for(let k=0;k<t.length;k++)v.setUint8(o+k,t.charCodeAt(k))};
+  w(0,'RIFF');v.setUint32(4,36+n*2,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*2,true);
+  return URL.createObjectURL(new Blob([b],{type:'audio/wav'}))})();
+const pos=()=>holding?holdAt:(audio.currentTime||0);
 async function memBlob(id){
   if(mem.has(id))return mem.get(id);
   const rec=await dbGet('audio',id);if(!rec)return null;
@@ -477,58 +491,62 @@ async function memBlob(id){
   for(const k of[...mem.keys()])if(!keep.has(k))mem.delete(k);
   return b;
 }
+function seekOnLoad(at){if(at)audio.addEventListener('loadedmetadata',()=>{try{audio.currentTime=at}catch{}},{once:true})}
 function setSrc(b,at){
-  if(curURL)URL.revokeObjectURL(curURL);
-  curURL=URL.createObjectURL(b);lastTime=at||0;
-  audio.src=at?curURL+'#t='+at.toFixed(2):curURL;
-  if(at)audio.addEventListener('loadedmetadata',()=>{try{if(Math.abs(audio.currentTime-at)>1)audio.currentTime=at}catch{}},{once:true});
+  if(trackURL)URL.revokeObjectURL(trackURL);
+  trackURL=URL.createObjectURL(b);
+  clearTimeout(holdTimer);holding=false;lastSwap=Date.now();
+  audio.loop=true;audio.src=trackURL;lastTime=prevT=at||0;trackDur=cur()?.duration||0;
+  seekOnLoad(at);
 }
-/* iPhone : on déclare l'appli comme lecteur de musique (Safari 17+) pour garder
-   la sortie audio active quand l'écran est verrouillé. */
-function audioSession(){try{if(navigator.audioSession&&navigator.audioSession.type!=='playback')navigator.audioSession.type='playback'}catch{}}
-audioSession();
-let pausedInBg=false,watch=0;
 async function load(play,at=0){
   const t=cur();if(!t)return;fails=0;
-  const b=await memBlob(t.id);if(!b){toast('Fichier introuvable');return}
+  const b=mem.get(t.id)||await memBlob(t.id);if(!b){toast('Fichier introuvable');return}
   if(cur()!==t)return;
   setSrc(b,at);
-  if(play)doPlay();
+  if(play)doPlay();else wantPlay=false;
   updatePlayer();updateMS(t);save();
   setTimeout(()=>{const n=queue[qi+1]??(repeat==='all'?queue[0]:null);if(n)memBlob(n).catch(()=>{})},1500);
 }
 async function recover(play){
-  const t=cur();if(!t||fails++>2)return;
+  const t=cur();if(!t||holding||fails++>2)return;
   const b=mem.get(t.id)||await memBlob(t.id);if(!b)return;
-  setSrc(b,lastTime);if(play)audio.play().catch(()=>{});updateMS(t);
+  setSrc(b,lastTime);if(play)audio.play().catch(()=>{});
 }
 function doPlay(){
-  wantPlay=true;const t=cur();if(!t)return;audioSession();
-  // Après une pause écran verrouillé, iOS coupe le lien entre le lecteur et la sortie son :
-  // on recharge le titre à la même position avant de relancer, sinon la lecture reprend sans son.
-  if(audio.error||!audio.src||pausedInBg){
-    pausedInBg=false;const at=audio.currentTime||lastTime;const b=mem.get(t.id);
-    if(b){setSrc(b,at);audio.play().catch(()=>recover(true));updateMS(t)}else{lastTime=at;recover(true)}
-  }else audio.play().catch(e=>{if(e&&e.name==='NotAllowedError')return;recover(true)});
-  // Garde-fou : si la lecture ne progresse pas, on recharge.
-  clearTimeout(watch);const t0=audio.currentTime;
-  watch=setTimeout(()=>{if(wantPlay&&cur()===t&&!audio.paused&&audio.currentTime===t0){lastTime=t0;fails=0;recover(true)}},2500);
+  const t=cur();if(!t)return;
+  wantPlay=true;clearTimeout(holdTimer);
+  if(holding){holding=false;lastSwap=Date.now();audio.loop=true;audio.src=trackURL;lastTime=prevT=holdAt;seekOnLoad(holdAt)}
+  if(audio.error||!audio.src){recover(true);return}
+  audio.play().catch(e=>{if(e&&e.name==='NotAllowedError')return;recover(true)});
+  updatePP();updatePos();
 }
 function doPause(){
-  wantPlay=false;clearTimeout(watch);lastTime=audio.currentTime||lastTime;audio.pause();
-  if(document.visibilityState==='hidden')pausedInBg=true;
-  save();updatePos();
+  if(!cur())return;
+  wantPlay=false;
+  if(IOS&&!holding&&!audio.paused){
+    holdAt=lastTime=audio.currentTime;holding=true;lastSwap=Date.now();
+    audio.loop=true;audio.src=SILENCE;audio.play().catch(()=>{});
+    clearTimeout(holdTimer);holdTimer=setTimeout(()=>{if(holding&&!wantPlay)audio.pause()},5*60*1000);
+  }else if(!holding){lastTime=audio.currentTime;audio.pause()}
+  save();updatePP();updatePos();
 }
-function toggle(){if(!cur())return;audio.paused?doPlay():doPause()}
+function toggle(){if(!cur())return;wantPlay?doPause():doPlay()}
+function seekTo(t){
+  t=Math.max(0,t);manualSeek=Date.now();lastTime=prevT=t;
+  if(holding)holdAt=t;
+  else if(audio.error||!audio.src)recover(wantPlay);
+  else{try{audio.currentTime=t}catch{}}
+  updateTime(t);updatePos();save();
+}
 function next(auto){
   if(!queue.length)return;
-  if(auto&&repeat==='one'){audio.currentTime=0;doPlay();return}
   if(qi<queue.length-1)qi++;
   else if(repeat==='all'||!auto)qi=0;
-  else{doPause();audio.currentTime=0;return}
+  else{doPause();seekTo(0);return}
   load(true);
 }
-function prev(){if(!queue.length)return;if(audio.currentTime>3){seekTo(0);return}qi=qi>0?qi-1:queue.length-1;load(true)}
+function prev(){if(!queue.length)return;if(pos()>3){seekTo(0);return}qi=qi>0?qi-1:queue.length-1;load(true)}
 function toggleShuffle(){
   shuffle=!shuffle;ls.set('shuffle',shuffle);const c=queue[qi];
   if(c){if(shuffle){queue=[c,...shuffled(base.filter(i=>i!==c))];qi=0}else{queue=[...base];qi=Math.max(0,queue.indexOf(c))}}
@@ -540,24 +558,36 @@ function playNext(id){
   if(!cur()){playList([id],0,'File d\'attente');return}
   queue.splice(qi+1,0,id);const bi=base.indexOf(queue[qi]);base.splice(bi+1,0,id);toast('Sera lu ensuite',1500);save();
 }
-audio.addEventListener('ended',()=>next(true));
-audio.addEventListener('play',()=>{updatePP();updatePos()});audio.addEventListener('pause',()=>{updatePP();updatePos()});
-audio.addEventListener('loadedmetadata',updatePos);audio.addEventListener('seeked',updatePos);
-audio.addEventListener('playing',()=>{fails=0});
-audio.addEventListener('error',()=>{if(cur())recover(wantPlay)});
-audio.addEventListener('timeupdate',()=>{
-  if(audio.currentTime>0)lastTime=audio.currentTime;
-  const d=audio.duration||cur()?.duration||0,p=d?audio.currentTime/d*100:0;
+function updateTime(t){
+  const d=trackDur||cur()?.duration||0,p=d?Math.min(t/d,1)*100:0;
   $('#mini-bar').style.width=p+'%';
-  if(!seeking){const s=$('#np-seek');s.value=p*10;s.style.setProperty('--p',p+'%');$('#np-cur').textContent=fmt(audio.currentTime);$('#np-dur').textContent=fmt(d)}
-  if(Math.round(audio.currentTime)%5===0)save();
+  if(!seeking){const sk=$('#np-seek');sk.value=p*10;sk.style.setProperty('--p',p+'%');$('#np-cur').textContent=fmt(t);$('#np-dur').textContent=fmt(d)}
+}
+audio.addEventListener('loadedmetadata',()=>{if(!holding&&isFinite(audio.duration)&&audio.duration>0)trackDur=audio.duration;updatePos()});
+audio.addEventListener('timeupdate',()=>{
+  if(holding)return;
+  const t=audio.currentTime,d=trackDur;
+  // Retour au début d'un titre joué en boucle = fin du titre
+  if(d&&prevT>d-5&&t+5<prevT&&Date.now()-manualSeek>500&&Date.now()-lastSwap>500){prevT=t;trackEnded();return}
+  prevT=t;if(t>0)lastTime=t;updateTime(t);
+  if(Math.floor(t)%5===0)save();
 });
+function trackEnded(){if(repeat==='one'){updatePos();return}next(true)}
+audio.addEventListener('ended',()=>{if(!holding)trackEnded()});
+audio.addEventListener('playing',()=>{fails=0;updatePP();updatePos()});
+audio.addEventListener('play',updatePP);
+audio.addEventListener('pause',()=>{
+  // Pause venant d'iOS (appel, écouteurs retirés…) et pas de l'appli
+  if(!holding&&wantPlay&&Date.now()-lastSwap>1000&&!audio.seeking){wantPlay=false;save()}
+  updatePP();updatePos();
+});
+audio.addEventListener('error',()=>{if(cur()&&!holding)recover(wantPlay)});
 const seek=$('#np-seek');
-seek.addEventListener('input',()=>{seeking=true;const d=audio.duration||0,v=seek.value/1000;seek.style.setProperty('--p',v*100+'%');$('#np-cur').textContent=fmt(v*d)});
-seek.addEventListener('change',()=>{const d=audio.duration||0;if(d)seekTo(seek.value/1000*d);seeking=false});
+seek.addEventListener('input',()=>{seeking=true;const d=trackDur||0,v=seek.value/1000;seek.style.setProperty('--p',v*100+'%');$('#np-cur').textContent=fmt(v*d)});
+seek.addEventListener('change',()=>{const d=trackDur||0;seeking=false;if(d)seekTo(seek.value/1000*d)});
 
 function updatePP(){
-  const playing=!audio.paused;
+  const playing=wantPlay;
   $('#mini-pp').innerHTML=ic(playing?'pause':'play');$('#np-pp').innerHTML=ic(playing?'pause':'play');
   $('#np-art').classList.toggle('paused',!playing);document.body.classList.toggle('paused',!playing);
   if('mediaSession'in navigator)navigator.mediaSession.playbackState=playing?'playing':'paused';
@@ -589,14 +619,8 @@ async function updateMS(t){
 }
 function updatePos(){
   if(!('mediaSession'in navigator)||!navigator.mediaSession.setPositionState)return;
-  const d=audio.duration;if(!isFinite(d)||d<=0)return;
-  try{navigator.mediaSession.setPositionState({duration:d,playbackRate:audio.playbackRate||1,position:Math.min(Math.max(audio.currentTime,0),d)})}catch{}
-}
-function seekTo(t){
-  lastTime=t;
-  if(audio.error||!audio.src){recover(wantPlay);return}
-  try{audio.currentTime=t}catch{recover(wantPlay)}
-  updatePos();
+  const d=trackDur||cur()?.duration||0;if(!isFinite(d)||d<=0)return;
+  try{navigator.mediaSession.setPositionState({duration:d,playbackRate:1,position:Math.min(Math.max(pos(),0),d)})}catch{}
 }
 if('mediaSession'in navigator){const h=(a,f)=>{try{navigator.mediaSession.setActionHandler(a,f)}catch{}};
   h('play',doPlay);h('pause',doPause);h('stop',doPause);
@@ -606,9 +630,8 @@ if('mediaSession'in navigator){const h=(a,f)=>{try{navigator.mediaSession.setAct
    sauf si l'option « Couper la musique en quittant Écho » est activée. */
 let stopOnLeave=ls.get('stopOnLeave2',false);
 window.addEventListener('pagehide',()=>save());
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&audio.paused&&cur())pausedInBg=true;if(document.visibilityState==='hidden'){save();if(stopOnLeave&&!audio.paused)doPause()}});
-audio.addEventListener('pause',save);
-function save(){ls.set('state',{base,queue,qi,from,t:audio.currentTime||0})}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){save();if(stopOnLeave&&wantPlay)doPause()}});
+function save(){ls.set('state',{base,queue,qi,from,t:pos()})}
 function restore(){const s=ls.get('state',null);if(!s||!s.queue)return;
   queue=s.queue.filter(id=>tmap.has(id));base=(s.base||queue).filter(id=>tmap.has(id));
   const id=s.queue[s.qi];qi=queue.indexOf(id);from=s.from||'';if(qi<0){queue=[];qi=-1;return}load(false,s.t||0)}
@@ -630,7 +653,7 @@ async function deleteTrack(t){
   tracks=tracks.filter(x=>x!==t);rebuild();
   for(const p of playlists)if(p.ids.includes(t.id)){p.ids=p.ids.filter(x=>x!==t.id);await dbPut('playlists',p)}
   const ci=queue[qi];queue=queue.filter(x=>x!==t.id);base=base.filter(x=>x!==t.id);
-  if(wasCur){audio.pause();audio.removeAttribute('src');qi=Math.min(qi,queue.length-1);if(qi>=0)load(false);else updatePlayer()}else qi=queue.indexOf(ci);
+  if(wasCur){wantPlay=false;holding=false;clearTimeout(holdTimer);audio.pause();audio.removeAttribute('src');qi=Math.min(qi,queue.length-1);if(qi>=0)load(false);else updatePlayer()}else qi=queue.indexOf(ci);
   save();render();toast('Titre supprimé',1400);
 }
 
