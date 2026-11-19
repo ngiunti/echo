@@ -479,9 +479,15 @@ async function memBlob(id){
 }
 function setSrc(b,at){
   if(curURL)URL.revokeObjectURL(curURL);
-  curURL=URL.createObjectURL(b);audio.src=curURL;lastTime=at||0;
-  if(at)audio.addEventListener('loadedmetadata',()=>{try{audio.currentTime=at}catch{}},{once:true});
+  curURL=URL.createObjectURL(b);lastTime=at||0;
+  audio.src=at?curURL+'#t='+at.toFixed(2):curURL;
+  if(at)audio.addEventListener('loadedmetadata',()=>{try{if(Math.abs(audio.currentTime-at)>1)audio.currentTime=at}catch{}},{once:true});
 }
+/* iPhone : on déclare l'appli comme lecteur de musique (Safari 17+) pour garder
+   la sortie audio active quand l'écran est verrouillé. */
+function audioSession(){try{if(navigator.audioSession&&navigator.audioSession.type!=='playback')navigator.audioSession.type='playback'}catch{}}
+audioSession();
+let pausedInBg=false,watch=0;
 async function load(play,at=0){
   const t=cur();if(!t)return;fails=0;
   const b=await memBlob(t.id);if(!b){toast('Fichier introuvable');return}
@@ -494,14 +500,25 @@ async function load(play,at=0){
 async function recover(play){
   const t=cur();if(!t||fails++>2)return;
   const b=mem.get(t.id)||await memBlob(t.id);if(!b)return;
-  setSrc(b,lastTime);if(play)audio.play().catch(()=>{});
+  setSrc(b,lastTime);if(play)audio.play().catch(()=>{});updateMS(t);
 }
 function doPlay(){
-  wantPlay=true;if(!cur())return;
-  if(audio.error||!audio.src){recover(true);return}
-  audio.play().catch(e=>{if(e&&e.name==='NotAllowedError')return;recover(true)});
+  wantPlay=true;const t=cur();if(!t)return;audioSession();
+  // Après une pause écran verrouillé, iOS coupe le lien entre le lecteur et la sortie son :
+  // on recharge le titre à la même position avant de relancer, sinon la lecture reprend sans son.
+  if(audio.error||!audio.src||pausedInBg){
+    pausedInBg=false;const at=audio.currentTime||lastTime;const b=mem.get(t.id);
+    if(b){setSrc(b,at);audio.play().catch(()=>recover(true));updateMS(t)}else{lastTime=at;recover(true)}
+  }else audio.play().catch(e=>{if(e&&e.name==='NotAllowedError')return;recover(true)});
+  // Garde-fou : si la lecture ne progresse pas, on recharge.
+  clearTimeout(watch);const t0=audio.currentTime;
+  watch=setTimeout(()=>{if(wantPlay&&cur()===t&&!audio.paused&&audio.currentTime===t0){lastTime=t0;fails=0;recover(true)}},2500);
 }
-function doPause(){wantPlay=false;audio.pause();save()}
+function doPause(){
+  wantPlay=false;clearTimeout(watch);lastTime=audio.currentTime||lastTime;audio.pause();
+  if(document.visibilityState==='hidden')pausedInBg=true;
+  save();updatePos();
+}
 function toggle(){if(!cur())return;audio.paused?doPlay():doPause()}
 function next(auto){
   if(!queue.length)return;
@@ -589,7 +606,7 @@ if('mediaSession'in navigator){const h=(a,f)=>{try{navigator.mediaSession.setAct
    sauf si l'option « Couper la musique en quittant Écho » est activée. */
 let stopOnLeave=ls.get('stopOnLeave2',false);
 window.addEventListener('pagehide',()=>save());
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){save();if(stopOnLeave&&!audio.paused)doPause()}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&audio.paused&&cur())pausedInBg=true;if(document.visibilityState==='hidden'){save();if(stopOnLeave&&!audio.paused)doPause()}});
 audio.addEventListener('pause',save);
 function save(){ls.set('state',{base,queue,qi,from,t:audio.currentTime||0})}
 function restore(){const s=ls.get('state',null);if(!s||!s.queue)return;
