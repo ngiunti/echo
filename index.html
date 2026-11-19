@@ -127,7 +127,8 @@ h2{font-size:21px;font-weight:800;letter-spacing:-.3px;margin:28px 16px 12px}
 #mini .bar{position:absolute;left:8px;right:8px;bottom:0;height:2px;background:#ffffff40;border-radius:2px;overflow:hidden}
 #mini .bar i{display:block;height:100%;background:#fff;width:0}
 
-#tabs{position:fixed;left:0;right:0;bottom:0;height:calc(var(--nav) + var(--sb));padding-bottom:var(--sb);background:linear-gradient(to top,#000 0%,#000e 55%,#0000);display:flex;justify-content:space-around;align-items:center;z-index:19}
+#tabs{position:fixed;left:0;right:0;bottom:0;height:calc(var(--nav) + var(--sb));padding-bottom:var(--sb);background:rgba(14,14,16,.72);-webkit-backdrop-filter:saturate(180%) blur(24px);backdrop-filter:saturate(180%) blur(24px);border-top:1px solid #ffffff12;display:flex;justify-content:space-around;align-items:center;z-index:19}
+#statusblur{position:fixed;left:0;right:0;top:0;height:var(--st);background:rgba(18,18,18,.6);-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);z-index:30;pointer-events:none}
 #tabs button{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10.5px;color:var(--tx2);width:90px;padding-top:6px}
 #tabs button.on{color:#fff}
 #tabs svg{width:25px;height:25px}
@@ -175,11 +176,20 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .sh-item svg{width:24px;height:24px;color:var(--tx2)}
 .sh-item.danger,.sh-item.danger svg{color:#ff6b6b}
 
+.setting{display:flex;align-items:center;gap:14px;width:100%;margin-top:18px;padding:14px 16px;border-top:1px solid #ffffff14}
+.setting div{flex:1;min-width:0}
+.setting b{display:block;font-size:15px;font-weight:600}
+.setting small{display:block;color:var(--tx2);font-size:12.5px;line-height:1.4;margin-top:4px}
+.sw{flex:none;width:50px;height:30px;border-radius:15px;background:#4a4a4a;position:relative;transition:background .2s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 2px 4px #0005}
+.sw.on{background:var(--ac)}
+.sw.on::after{transform:translateX(20px)}
 #toast{position:fixed;left:50%;bottom:calc(var(--nav) + var(--sb) + 74px);transform:translate(-50%,20px);background:#fff;color:#121212;font-size:14px;font-weight:600;padding:11px 18px;border-radius:8px;opacity:0;transition:.25s;z-index:70;pointer-events:none;max-width:88vw;text-align:center;box-shadow:0 8px 24px #0008}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 </style>
 </head>
 <body>
+<div id="statusblur"></div>
 <main id="view"></main>
 
 <div id="mini" class="hidden" data-act="np-open">
@@ -453,25 +463,55 @@ async function playList(ids,start=0,label='',forceShuffle){
   else{queue=[...ids];qi=start}
   await load(true);
 }
-async function load(play,at=0){
-  const t=cur();if(!t)return;
-  const rec=await dbGet('audio',t.id);if(!rec){toast('Fichier introuvable');return}
-  if(curURL)URL.revokeObjectURL(curURL);
-  curURL=URL.createObjectURL(rec.blob);audio.src=curURL;
-  if(at)audio.addEventListener('loadedmetadata',()=>{audio.currentTime=at},{once:true});
-  if(play)audio.play().catch(()=>{});
-  updatePlayer();updateMS(t);save();
+/* Le son est chargé en mémoire (et pas lu directement depuis la base) :
+   sur iPhone, un fichier lu depuis IndexedDB peut devenir illisible quand
+   l'appli passe en arrière-plan, ce qui cassait pause/lecture/avance rapide
+   depuis l'écran verrouillé. */
+const mem=new Map();let wantPlay=false,lastTime=0,fails=0;
+async function memBlob(id){
+  if(mem.has(id))return mem.get(id);
+  const rec=await dbGet('audio',id);if(!rec)return null;
+  const b=new Blob([await rec.blob.arrayBuffer()],{type:rec.blob.type||'audio/mpeg'});
+  mem.set(id,b);
+  const keep=new Set([queue[qi],queue[qi+1],queue[qi-1],queue[0],id]);
+  for(const k of[...mem.keys()])if(!keep.has(k))mem.delete(k);
+  return b;
 }
-function toggle(){if(!cur())return;audio.paused?audio.play().catch(()=>{}):audio.pause()}
+function setSrc(b,at){
+  if(curURL)URL.revokeObjectURL(curURL);
+  curURL=URL.createObjectURL(b);audio.src=curURL;lastTime=at||0;
+  if(at)audio.addEventListener('loadedmetadata',()=>{try{audio.currentTime=at}catch{}},{once:true});
+}
+async function load(play,at=0){
+  const t=cur();if(!t)return;fails=0;
+  const b=await memBlob(t.id);if(!b){toast('Fichier introuvable');return}
+  if(cur()!==t)return;
+  setSrc(b,at);
+  if(play)doPlay();
+  updatePlayer();updateMS(t);save();
+  setTimeout(()=>{const n=queue[qi+1]??(repeat==='all'?queue[0]:null);if(n)memBlob(n).catch(()=>{})},1500);
+}
+async function recover(play){
+  const t=cur();if(!t||fails++>2)return;
+  const b=mem.get(t.id)||await memBlob(t.id);if(!b)return;
+  setSrc(b,lastTime);if(play)audio.play().catch(()=>{});
+}
+function doPlay(){
+  wantPlay=true;if(!cur())return;
+  if(audio.error||!audio.src){recover(true);return}
+  audio.play().catch(e=>{if(e&&e.name==='NotAllowedError')return;recover(true)});
+}
+function doPause(){wantPlay=false;audio.pause();save()}
+function toggle(){if(!cur())return;audio.paused?doPlay():doPause()}
 function next(auto){
   if(!queue.length)return;
-  if(auto&&repeat==='one'){audio.currentTime=0;audio.play();return}
+  if(auto&&repeat==='one'){audio.currentTime=0;doPlay();return}
   if(qi<queue.length-1)qi++;
   else if(repeat==='all'||!auto)qi=0;
-  else{audio.pause();audio.currentTime=0;return}
+  else{doPause();audio.currentTime=0;return}
   load(true);
 }
-function prev(){if(!queue.length)return;if(audio.currentTime>3){audio.currentTime=0;return}qi=qi>0?qi-1:queue.length-1;load(true)}
+function prev(){if(!queue.length)return;if(audio.currentTime>3){seekTo(0);return}qi=qi>0?qi-1:queue.length-1;load(true)}
 function toggleShuffle(){
   shuffle=!shuffle;ls.set('shuffle',shuffle);const c=queue[qi];
   if(c){if(shuffle){queue=[c,...shuffled(base.filter(i=>i!==c))];qi=0}else{queue=[...base];qi=Math.max(0,queue.indexOf(c))}}
@@ -484,8 +524,12 @@ function playNext(id){
   queue.splice(qi+1,0,id);const bi=base.indexOf(queue[qi]);base.splice(bi+1,0,id);toast('Sera lu ensuite',1500);save();
 }
 audio.addEventListener('ended',()=>next(true));
-audio.addEventListener('play',updatePP);audio.addEventListener('pause',updatePP);
+audio.addEventListener('play',()=>{updatePP();updatePos()});audio.addEventListener('pause',()=>{updatePP();updatePos()});
+audio.addEventListener('loadedmetadata',updatePos);audio.addEventListener('seeked',updatePos);
+audio.addEventListener('playing',()=>{fails=0});
+audio.addEventListener('error',()=>{if(cur())recover(wantPlay)});
 audio.addEventListener('timeupdate',()=>{
+  if(audio.currentTime>0)lastTime=audio.currentTime;
   const d=audio.duration||cur()?.duration||0,p=d?audio.currentTime/d*100:0;
   $('#mini-bar').style.width=p+'%';
   if(!seeking){const s=$('#np-seek');s.value=p*10;s.style.setProperty('--p',p+'%');$('#np-cur').textContent=fmt(audio.currentTime);$('#np-dur').textContent=fmt(d)}
@@ -493,7 +537,7 @@ audio.addEventListener('timeupdate',()=>{
 });
 const seek=$('#np-seek');
 seek.addEventListener('input',()=>{seeking=true;const d=audio.duration||0,v=seek.value/1000;seek.style.setProperty('--p',v*100+'%');$('#np-cur').textContent=fmt(v*d)});
-seek.addEventListener('change',()=>{const d=audio.duration||0;if(d)audio.currentTime=seek.value/1000*d;seeking=false});
+seek.addEventListener('change',()=>{const d=audio.duration||0;if(d)seekTo(seek.value/1000*d);seeking=false});
 
 function updatePP(){
   const playing=!audio.paused;
@@ -526,9 +570,27 @@ async function updateMS(t){
   const artwork=[];if(t.cover){const u=await blobToDataURL(t.cover);if(u)artwork.push({src:u,sizes:'600x600',type:'image/jpeg'})}
   navigator.mediaSession.metadata=new MediaMetadata({title:t.title,artist:t.artist,album:t.album||'',artwork});
 }
+function updatePos(){
+  if(!('mediaSession'in navigator)||!navigator.mediaSession.setPositionState)return;
+  const d=audio.duration;if(!isFinite(d)||d<=0)return;
+  try{navigator.mediaSession.setPositionState({duration:d,playbackRate:audio.playbackRate||1,position:Math.min(Math.max(audio.currentTime,0),d)})}catch{}
+}
+function seekTo(t){
+  lastTime=t;
+  if(audio.error||!audio.src){recover(wantPlay);return}
+  try{audio.currentTime=t}catch{recover(wantPlay)}
+  updatePos();
+}
 if('mediaSession'in navigator){const h=(a,f)=>{try{navigator.mediaSession.setActionHandler(a,f)}catch{}};
-  h('play',()=>audio.play());h('pause',()=>audio.pause());h('previoustrack',prev);h('nexttrack',()=>next(false));
-  h('seekto',e=>{if(e.seekTime!=null)audio.currentTime=e.seekTime})}
+  h('play',doPlay);h('pause',doPause);h('stop',doPause);
+  h('previoustrack',prev);h('nexttrack',()=>next(false));
+  h('seekto',e=>{if(e.seekTime!=null)seekTo(e.seekTime)});}
+/* En arrière-plan : on sauvegarde la position. La musique continue (écran verrouillé),
+   sauf si l'option « Couper la musique en quittant Écho » est activée. */
+let stopOnLeave=ls.get('stopOnLeave2',false);
+window.addEventListener('pagehide',()=>save());
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){save();if(stopOnLeave&&!audio.paused)doPause()}});
+audio.addEventListener('pause',save);
 function save(){ls.set('state',{base,queue,qi,from,t:audio.currentTime||0})}
 function restore(){const s=ls.get('state',null);if(!s||!s.queue)return;
   queue=s.queue.filter(id=>tmap.has(id));base=(s.base||queue).filter(id=>tmap.has(id));
@@ -655,6 +717,7 @@ function libView(){
     <div class="r"><button class="iconbtn" data-act="import" aria-label="Importer">${ic('imp')}</button><button class="iconbtn" data-act="newpl" aria-label="Nouvelle playlist">${ic('plus')}</button></div></div>
   <div class="chips">${chip('all','Tout')}${chip('pl','Playlists')}${chip('al','Albums')}${chip('ar','Artistes')}</div>
   ${items.join('')}
+  <button class="setting" data-act="stopleave"><div><b>Couper la musique en quittant Écho</b><small>Met en pause dès que tu quittes l'appli ou verrouilles l'écran (les commandes de l'écran verrouillé ne servent alors plus). Désactivé par défaut.</small></div><span class="sw${stopOnLeave?' on':''}"></span></button>
   <p class="note" id="storage"></p>`;
 }
 function detailView(r){
@@ -696,6 +759,7 @@ document.addEventListener('click',e=>{
     case'import':pickFiles();break;
     case'newpl':newPlaylist();break;
     case'libf':libF=el.dataset.k;render();break;
+    case'stopleave':stopOnLeave=!stopOnLeave;ls.set('stopOnLeave2',stopOnLeave);el.querySelector('.sw').classList.toggle('on',stopOnLeave);toast(stopOnLeave?'La musique s\'arrêtera en quittant Écho':'La musique continuera en arrière-plan',2000);break;
     case'row':playList(listIds,+el.dataset.i,listLabel);break;
     case'more':e.stopPropagation();trackMenu(el.dataset.id,listCtx);break;
     case'play-list':if(listIds.length){if(base.join()===listIds.join()&&cur())toggle();else playList(listIds,0,listLabel,shuffle?true:undefined)}break;
